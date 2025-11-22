@@ -1,6 +1,8 @@
 fastapi
 uvicorn
 yt-dlp
+requests
 pydantic
 python-dotenv
-requests
+beautifulsoup4
+lxml
