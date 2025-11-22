@@ -3,3 +3,5 @@ uvicorn
 yt-dlp
 pydantic
 python-dotenv
+requests
+beautifulsoup4
