@@ -1,11 +1,13 @@
 import os
 import uvicorn
 import yt_dlp
-from fastapi import FastAPI, HTTPException, Header, Depends
+import requests
+from fastapi import FastAPI, HTTPException, Header, Depends, Query
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Pro All-In-One Downloader", version="4.0.0")
+app = FastAPI(title="Pro Stream Downloader", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,90 +19,78 @@ app.add_middleware(
 
 MASTER_KEY = "123Lock.on"
 
-# Update Model to accept 'mode'
 class VideoRequest(BaseModel):
     url: str
-    mode: str = "video"  # Options: "video" or "audio"
+    mode: str = "video"
 
 async def verify_api_key(x_api_key: str = Header(None)):
     if x_api_key != MASTER_KEY:
         raise HTTPException(status_code=403, detail="Access Denied")
 
-@app.get("/")
-def health_check():
-    # Frontend calls this to check if API is Online
-    return {"status": "Online", "message": "Server is ready"}
-
-@app.post("/extract", dependencies=[Depends(verify_api_key)])
-def extract_info(request: VideoRequest):
-    url = request.url
-    mode = request.mode.lower()
-    print(f"⚡ Processing: {url} | Mode: {mode}")
-
-    # Base Configuration
+# --- HELPER TO GET DIRECT LINK ---
+def get_direct_url(url, mode):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
         'force_ipv4': True,
         'nocheckcertificate': True,
-        'socket_timeout': 30,
-        # Mobile User Agent to avoid bot detection
-        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', 
     }
-
-    # --- FORMAT SELECTION LOGIC ---
+    
     if mode == "audio":
-        # Best Audio Only
         ydl_opts['format'] = 'bestaudio/best'
     else:
-        # Best Video (MP4 preferred for compatibility)
         ydl_opts['format'] = 'best[ext=mp4]/best'
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # Smart Extraction
-            direct_url = info.get('url')
-            
-            # If direct URL is missing, hunt for the specific format
-            if not direct_url and 'formats' in info:
-                # If Audio Mode requested
-                if mode == "audio":
-                     for f in info['formats']:
-                        if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                            direct_url = f['url']
-                            break 
-                # If Video Mode requested
-                else:
-                    for f in info['formats']:
-                        if f.get('ext') == 'mp4' and f.get('vcodec') != 'none':
-                            direct_url = f['url']
-                            # Keep looking for better quality, but don't break immediately
-            
-            # Fallback
-            if not direct_url:
-                # Just grab the very last format (usually the highest quality available)
-                if 'formats' in info and len(info['formats']) > 0:
-                    direct_url = info['formats'][-1]['url']
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info.get('url'), info.get('title', 'video')
 
-            return {
-                "status": "success",
-                "mode": mode,
-                "title": info.get('title') or "Unknown Video",
-                "thumbnail": info.get('thumbnail'),
-                "download_url": direct_url,
-                "duration": info.get('duration'),
-                "filesize": info.get('filesize_approx')
-            }
+@app.post("/extract", dependencies=[Depends(verify_api_key)])
+def extract_info(request: VideoRequest):
+    # This endpoint now generates a "Proxy Link" instead of a raw YouTube link
+    return {
+        "status": "success",
+        "mode": request.mode,
+        # We point the browser back to OUR server, not YouTube
+        "download_url": f"/stream?url={request.url}&mode={request.mode}&key={MASTER_KEY}",
+        "original_url": request.url
+    }
+
+# --- THE PROXY STREAMING ENDPOINT ---
+@app.get("/stream")
+def stream_video(url: str = Query(...), mode: str = Query("video"), key: str = Query(...)):
+    """
+    The Server downloads the file and passes it to the User (Bypasses 403 Error).
+    """
+    if key != MASTER_KEY:
+        raise HTTPException(status_code=403, detail="Invalid Key")
+
+    try:
+        # 1. Get the locked URL (Server side)
+        direct_url, title = get_direct_url(url, mode)
+        
+        # 2. Open a connection to YouTube (Server side)
+        # We use stream=True so we don't load the whole file into RAM
+        youtube_response = requests.get(direct_url, stream=True)
+        
+        # 3. Determine Filename and Type
+        ext = "mp3" if mode == "audio" else "mp4"
+        safe_title = "".join([c for c in title if c.isalnum() or c in " _-"])[:50]
+        filename = f"{safe_title}.{ext}"
+        media_type = "audio/mpeg" if mode == "audio" else "video/mp4"
+
+        # 4. Stream it back to the user
+        return StreamingResponse(
+            youtube_response.iter_content(chunk_size=1024*1024), # 1MB chunks
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"❌ Error: {error_msg}")
-        if "Login" in error_msg:
-            raise HTTPException(status_code=400, detail="Video is Private or Age Restricted.")
-        raise HTTPException(status_code=500, detail="Failed to process video.")
+        print(f"Stream Error: {e}")
+        raise HTTPException(status_code=500, detail="Could not stream video")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
