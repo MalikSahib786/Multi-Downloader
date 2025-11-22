@@ -1,6 +1,5 @@
 import os
-import random
-import uvicorn  # <--- THIS WAS MISSING
+import uvicorn
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,84 +7,73 @@ from pydantic import BaseModel
 
 # --- CONFIGURATION ---
 app = FastAPI(
-    title="Ultimate Video Downloader API",
-    description="API to extract direct video links from YouTube, TikTok, etc.",
-    version="1.0.0"
+    title="Professional Video Downloader",
+    version="2.0.0"
 )
 
-# --- CORS MIDDLEWARE (Required for Frontend/Website) ---
+# --- CORS (Required for your Frontend) ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all websites to access this API
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 1. SECURITY: Define your Secret API Key
-SECRET_API_KEY = os.getenv("MY_API_KEY", "password123")
+# --- REAL CREDENTIAL SYSTEM ---
+# We hardcode it here so there are NO mistakes with Environment Variables
+# You must send "x-api-key: 123Lock.on" in your request headers.
+MASTER_KEY = "123Lock.on"
 
-# 2. PROXIES: Load proxies from Environment Variable
-PROXY_STRING = os.getenv("PROXY_LIST", "") 
-PROXY_LIST = [p.strip() for p in PROXY_STRING.split(",")] if PROXY_STRING else []
-
-# --- MODELS ---
+# --- INPUT MODEL ---
 class VideoRequest(BaseModel):
     url: str
 
-# --- HELPER FUNCTIONS ---
+# --- SECURITY FUNCTION ---
 async def verify_api_key(x_api_key: str = Header(None)):
-    # If no key set in ENV, allow everyone. If key set, check it.
-    if SECRET_API_KEY and x_api_key != SECRET_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API Key")
+    """
+    Enforces strict authentication.
+    """
+    if x_api_key != MASTER_KEY:
+        # Logs the attempt for security monitoring
+        print(f"🚫 Unauthorized Access Attempt with key: '{x_api_key}'")
+        raise HTTPException(status_code=403, detail="Access Denied: Invalid Credential")
 
-def get_random_proxy():
-    if not PROXY_LIST:
-        return None
-    return random.choice(PROXY_LIST)
-
-# --- API ENDPOINTS ---
-
+# --- API ENDPOINT ---
 @app.get("/")
-def health_check():
-    return {"status": "online", "service": "Multi-Downloader API"}
+def home():
+    return {"status": "Active", "system": "Direct Railway Connection"}
 
-@app.post("/extract")
-def extract_video_info(request: VideoRequest, authorized: bool = Depends(verify_api_key)):
-    """
-    Main endpoint to get video details.
-    """
+@app.post("/extract", dependencies=[Depends(verify_api_key)])
+def extract_video_info(request: VideoRequest):
     url = request.url
-    proxy = get_random_proxy()
-    
-    print(f"Processing: {url} | Using Proxy: {proxy}")
+    print(f"⚡ Processing: {url} (Direct Connection)")
 
+    # Configuration for Railway Direct Connection
     ydl_opts = {
-        'format': 'best', 
+        'format': 'best',
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
-        'extract_flat': False, 
         
-        # NETWORK SETTINGS
-        'proxy': proxy,
-        'socket_timeout': 15,
-        'retries': 3,
+        # CRITICAL FOR RAILWAY:
+        'force_ipv4': True,      # Forces usage of standard internet
         'nocheckcertificate': True,
-        'force_ipv4': True, # Fixes the DNS error
+        'socket_timeout': 30,    # Longer timeout for large videos
         
-        # ANTI-BOT SETTINGS
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        # SPOOFING (Pretend to be a regular browser, not a bot)
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Extract Info
             info = ydl.extract_info(url, download=False)
             
-            # Logic to find the best direct video link
+            # Smart Link Extraction
             direct_url = info.get('url')
             
-            # Fallback logic
+            # If standard URL fails, look for specific MP4 formats
             if not direct_url and 'formats' in info:
                 for f in info['formats']:
                     if f.get('ext') == 'mp4' and f.get('acodec') != 'none':
@@ -94,22 +82,23 @@ def extract_video_info(request: VideoRequest, authorized: bool = Depends(verify_
             
             return {
                 "status": "success",
-                "platform": info.get('extractor'),
                 "title": info.get('title'),
-                "duration": info.get('duration'),
                 "thumbnail": info.get('thumbnail'),
                 "download_url": direct_url,
-                "views": info.get('view_count')
+                "duration": info.get('duration'),
+                "source": "Direct-Railway"
             }
 
     except Exception as e:
         error_msg = str(e)
-        print(f"Error: {error_msg}")
+        print(f"❌ Error: {error_msg}")
+        
+        # Handle common blocks
         if "Sign in" in error_msg:
-            raise HTTPException(status_code=429, detail="Proxy Blocked by YouTube. Try again.")
+            raise HTTPException(status_code=429, detail="YouTube blocked this Railway Server. Try again later.")
+        
         raise HTTPException(status_code=500, detail=error_msg)
 
 if __name__ == "__main__":
-    # Gets PORT from Railway, defaults to 8080
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
