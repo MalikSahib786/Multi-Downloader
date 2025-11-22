@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Ultimate Media API", version="9.0.0")
+app = FastAPI(title="Ultimate Media API", version="10.0.0")
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -26,50 +26,40 @@ async def verify_api_key(x_api_key: str = Header(None)):
     if x_api_key != MASTER_KEY:
         raise HTTPException(status_code=403, detail="Access Denied")
 
-# --- NEW: JSON-LD SCRAPER (Fixes Pixabay, Pexels, Instagram) ---
+# --- HELPER: FORMAT SIZE ---
+def format_size(bytes_size):
+    if not bytes_size: return "Unknown Size"
+    return f"{round(bytes_size / 1024 / 1024, 1)} MB"
+
+# --- HELPER: JSON-LD SCRAPER ---
 def try_json_ld_scrape(url):
     try:
         headers = {'User-Agent': USER_AGENT}
         res = requests.get(url, headers=headers, timeout=15)
         soup = BeautifulSoup(res.text, 'lxml')
         
-        # 1. Look for JSON-LD script tags
+        # Pixabay/Pexels JSON Logic
         scripts = soup.find_all('script', type='application/ld+json')
         for script in scripts:
             try:
                 data = json.loads(script.string)
-                # Pixabay/Pexels structure often has "contentUrl" or "video"
-                if isinstance(data, list): data = data[0] # Sometimes it's a list
+                if isinstance(data, list): data = data[0]
                 
                 video_url = data.get('contentUrl') or data.get('embedUrl')
-                
-                # Deep check for nested objects (common in Schema.org)
                 if not video_url and 'video' in data:
                     video_url = data['video'].get('contentUrl')
                 
                 if video_url:
-                    title = data.get('name') or data.get('headline') or soup.title.string
                     return {
                         "url": video_url,
-                        "title": title,
-                        "resolution": "HD (Stock)",
-                        "filesize": "Unknown"
+                        "title": data.get('name') or soup.title.string,
+                        "resolution": "HD Stock",
+                        "filesize": "Unknown Size"
                     }
             except:
                 continue
-                
-        # 2. Fallback to standard meta tags
-        og_vid = soup.find('meta', property='og:video')
-        if og_vid:
-            return {
-                "url": og_vid['content'],
-                "title": soup.title.string,
-                "resolution": "Standard",
-                "filesize": "Unknown"
-            }
-            
-    except Exception as e:
-        print(f"Scrape Error: {e}")
+    except Exception:
+        pass
     return None
 
 @app.post("/extract", dependencies=[Depends(verify_api_key)])
@@ -77,7 +67,7 @@ def extract_media(request: MediaRequest):
     url = request.url
     print(f"🔍 Processing: {url}")
 
-    # STEP 1: Try yt-dlp (YouTube, TikTok, FB)
+    # STEP 1: Try yt-dlp
     try:
         ydl_opts = {
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
@@ -87,24 +77,24 @@ def extract_media(request: MediaRequest):
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
             formats_list = []
-            
-            # LOGIC: Extract different qualities
-            # We look for MP4s with both Audio and Video
+            duration = info.get('duration', 0)
+
             if 'formats' in info:
                 for f in info['formats']:
-                    # Filter for mp4 video+audio or good quality audio
                     if f.get('url'):
                         f_ext = f.get('ext')
-                        f_note = f.get('format_note', 'Standard')
                         f_res = f.get('resolution') or f"{f.get('height')}p"
                         
-                        # Calculate Filesize
+                        # --- FIX: CALCULATE SIZE IF MISSING ---
                         size = f.get('filesize') or f.get('filesize_approx')
-                        size_str = f"{round(size / 1024 / 1024, 1)} MB" if size else "Unknown Size"
+                        if not size and f.get('tbr') and duration:
+                            # Estimate: (Bitrate * Duration) / 8
+                            size = (f.get('tbr') * 1024 * duration) / 8
+                        
+                        size_str = format_size(size)
 
-                        # 1. Video with Audio (The Best Ones)
+                        # 1. Best Video with Audio
                         if f_ext == 'mp4' and f.get('vcodec') != 'none' and f.get('acodec') != 'none':
                             formats_list.append({
                                 "type": "video",
@@ -120,7 +110,6 @@ def extract_media(request: MediaRequest):
                                 "url": f['url']
                             })
 
-            # If no formats found (TikTok often has just one 'url'), use main info
             if not formats_list:
                  direct_url = info.get('url')
                  if direct_url:
@@ -130,29 +119,25 @@ def extract_media(request: MediaRequest):
                          "url": direct_url
                      })
 
-            # Reverse to show Best Quality first
             formats_list.reverse()
 
-            # Prepare Response
             return {
                 "status": "success",
                 "title": info.get('title'),
                 "thumbnail": info.get('thumbnail'),
-                "source": "yt-dlp",
                 "options": formats_list
             }
 
     except Exception as e:
-        print(f"yt-dlp failed: {e}. Trying JSON-LD...")
+        print(f"yt-dlp failed: {e}")
 
-    # STEP 2: Pixabay/Pexels/Generic Fallback
+    # STEP 2: Generic Scraper Fallback
     scrape_data = try_json_ld_scrape(url)
     if scrape_data:
         return {
             "status": "success",
             "title": scrape_data['title'],
             "thumbnail": "https://cdn-icons-png.flaticon.com/512/8002/8002111.png",
-            "source": "scraper",
             "options": [{
                 "type": "video",
                 "label": f"Download File ({scrape_data['resolution']})",
@@ -162,38 +147,41 @@ def extract_media(request: MediaRequest):
 
     raise HTTPException(status_code=404, detail="Could not find media on this page.")
 
-# --- STREAMING ENDPOINT (The Fix for TikTok/Pixabay) ---
+# --- STREAMING ENDPOINT (FIXED) ---
 @app.get("/stream")
 def stream_content(target: str = Query(...), title: str = Query("file"), key: str = Query(...)):
     if key != MASTER_KEY:
         raise HTTPException(status_code=403, detail="Invalid Key")
 
     try:
-        # Decode URL if it was encoded by frontend
         target_url = unquote(target)
         
-        # HEADERS HACK: Fixes TikTok "Stream Connection Failed"
-        # TikTok requires the Referer to be tiktok.com
-        headers = {
-            'User-Agent': USER_AGENT,
-            'Referer': 'https://www.tiktok.com/',
-            'Range': 'bytes=0-' # Asks for the whole file
-        }
+        # --- SMART HEADERS ---
+        headers = {'User-Agent': USER_AGENT}
         
-        # 30 Second Timeout + SSL Verify False
+        # If TikTok: Needs Referer
+        if "tiktok.com" in target_url or "akamaized" in target_url:
+            headers['Referer'] = 'https://www.tiktok.com/'
+            
+        # If YouTube: Needs CLEAN headers (No Referer, sometimes No User-Agent)
+        # YouTube links are signed, sending wrong headers breaks the signature.
+        elif "googlevideo.com" in target_url:
+             headers = {} # Send empty headers for YouTube signed URLs
+
         external_req = requests.get(target_url, headers=headers, stream=True, verify=False, timeout=30)
         
+        # Retrying for weird servers
         if external_req.status_code >= 400:
-            # Try one more time without headers (sometimes Pixabay hates headers)
-            external_req = requests.get(target_url, stream=True, verify=False, timeout=30)
-            if external_req.status_code >= 400:
-                print(f"Source returned: {external_req.status_code}")
-                raise HTTPException(status_code=400, detail="Link Blocked by Source")
+             # Try again with no headers at all
+             external_req = requests.get(target_url, stream=True, verify=False, timeout=30)
+             
+        if external_req.status_code >= 400:
+            print(f"Stream Error Code: {external_req.status_code}")
+            raise HTTPException(status_code=400, detail=f"Source Blocked: {external_req.status_code}")
 
         content_type = external_req.headers.get('content-type', 'application/octet-stream')
-        
-        # Clean Title
         safe_title = "".join([c for c in title if c.isalnum() or c in " _-"])[:40]
+        
         ext = "mp4"
         if "audio" in content_type: ext = "mp3"
         if "image" in content_type: ext = "jpg"
@@ -201,13 +189,13 @@ def stream_content(target: str = Query(...), title: str = Query("file"), key: st
         filename = f"{safe_title}.{ext}"
 
         return StreamingResponse(
-            external_req.iter_content(chunk_size=64*1024), # 64KB Chunks
+            external_req.iter_content(chunk_size=64*1024),
             media_type=content_type,
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
 
     except Exception as e:
-        print(f"Stream Error: {e}")
+        print(f"Stream Exception: {e}")
         raise HTTPException(status_code=500, detail="Stream Failed")
 
 if __name__ == "__main__":
