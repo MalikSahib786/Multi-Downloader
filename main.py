@@ -1,10 +1,20 @@
-import os
-import random
-import uvicorn
 from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware # <--- IMPORT THIS
 from pydantic import BaseModel
 import yt_dlp
+import os
+import random
 
+app = FastAPI()
+
+# --- ADD THIS CORS BLOCK ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all websites to access your API (Change this for security later)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # --- CONFIGURATION ---
 app = FastAPI(
     title="Ultimate Video Downloader API",
