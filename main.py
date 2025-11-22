@@ -9,20 +9,17 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# SSL Warnings band kiye taake connection fast ho
+# SSL Warnings Disable (Zaroori hai)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Final Social Downloader", version="Fixed.1.0")
+app = FastAPI(title="Social Downloader Pro", version="Fixed.2.0")
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 MASTER_KEY = "123Lock.on"
-
-# --- THE GOLDEN RULE: SAME AGENT EVERYWHERE ---
-# Hum Mobile User Agent use karenge kyunke Social Media sites mobile ko kam block karti hain
-STRICT_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 
 class MediaRequest(BaseModel):
     url: str
@@ -38,48 +35,41 @@ def format_size(bytes_size):
 @app.post("/extract", dependencies=[Depends(verify_api_key)])
 def extract_media(request: MediaRequest):
     url = request.url
-    print(f"⚡ Processing: {url}")
+    print(f"⚡ Extracting: {url}")
 
     try:
+        # Extraction Configuration
         ydl_opts = {
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
             'force_ipv4': True, 'nocheckcertificate': True,
-            'user_agent': STRICT_UA, # STRICTLY USE MOBILE AGENT
-            'socket_timeout': 10,
+            'user_agent': MOBILE_UA,
+            'socket_timeout': 15,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             formats_list = []
             duration = info.get('duration', 0)
-            
-            # --- Format Parsing ---
+
+            # Formats Filtering
             if 'formats' in info:
                 for f in info['formats']:
                     if f.get('url'):
-                        # Size Logic
+                        f_ext = f.get('ext')
+                        f_res = f.get('resolution') or f"{f.get('height')}p"
+                        
                         size = f.get('filesize') or f.get('filesize_approx')
                         if not size and f.get('tbr') and duration:
                             size = (f.get('tbr') * 1024 * duration) / 8
                         size_str = format_size(size)
-                        
-                        f_ext = f.get('ext')
-                        f_res = f.get('resolution') or f"{f.get('height')}p"
 
-                        # Video
+                        # MP4 Video
                         if f_ext == 'mp4' and f.get('vcodec') != 'none':
-                            formats_list.append({
-                                "type": "video", 
-                                "label": f"{f_res} ({size_str})", 
-                                "url": f['url']
-                            })
-                        # Audio
+                            label = f"{f_res} ({size_str})"
+                            formats_list.append({"type": "video", "label": label, "url": f['url']})
+                        # Audio Only
                         elif f.get('vcodec') == 'none' and f.get('acodec') != 'none':
-                             formats_list.append({
-                                "type": "audio", 
-                                "label": f"Audio - {f_ext}", 
-                                "url": f['url']
-                            })
+                             formats_list.append({"type": "audio", "label": f"Audio - {f_ext}", "url": f['url']})
 
             if not formats_list:
                  direct = info.get('url')
@@ -96,49 +86,43 @@ def extract_media(request: MediaRequest):
 
     except Exception as e:
         print(f"Extraction Error: {e}")
-        raise HTTPException(status_code=400, detail="Could not find video")
+        raise HTTPException(status_code=400, detail=f"Extraction Failed: {str(e)}")
 
-# --- THE FIXED STREAMING ENDPOINT ---
+# --- STREAMING FIX ---
 @app.get("/stream")
 def stream_content(target: str = Query(...), title: str = Query("file"), key: str = Query(...)):
     if key != MASTER_KEY:
         raise HTTPException(status_code=403, detail="Invalid Key")
 
     target_url = unquote(target)
-    
-    # --- HEADER MAGIC (Yeh wo part hai jo error theek karega) ---
-    headers = {
-        'User-Agent': STRICT_UA, # Extraction wala same agent
-        'Accept': '*/*',
-        'Connection': 'keep-alive'
-    }
-    
-    # TikTok Special Handling
-    if "tiktok.com" in target_url or "byteoversea" in target_url:
-        headers['Referer'] = 'https://www.tiktok.com/'
-    
-    # YouTube Special Handling (Most Critical)
-    # YouTube Signed URLs FAIL agar hum Referer bhejein
-    elif "googlevideo.com" in target_url:
-        if 'Referer' in headers: del headers['Referer']
+    print(f"🌊 Streaming Request for: {title}")
 
     try:
-        # Request bhejte waqt verify=False aur stream=True zaroori hai
-        r = requests.get(target_url, headers=headers, stream=True, verify=False, timeout=20)
+        # 1. Headers Setup
+        headers = {
+            'User-Agent': MOBILE_UA,
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
+        }
         
-        # Agar Mobile Agent fail ho jaye (403), to Desktop Agent try karo
-        if r.status_code == 403:
-            print("⚠️ 403 Blocked. Retrying with Desktop Agent...")
-            headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            r = requests.get(target_url, headers=headers, stream=True, verify=False, timeout=20)
+        # 2. Platform Specific Rules
+        if "tiktok.com" in target_url or "byteoversea" in target_url:
+            headers['Referer'] = 'https://www.tiktok.com/'
+        elif "googlevideo.com" in target_url:
+            # YouTube links are signed. Sending headers often breaks them.
+            headers = {} 
 
-        # Final Check
+        # 3. Connect with INCREASED TIMEOUT (30s connect, 120s read)
+        # stream=True is REQUIRED. verify=False prevents SSL errors.
+        r = requests.get(target_url, headers=headers, stream=True, verify=False, timeout=(30, 120))
+
+        # 4. Check Status Code
         if r.status_code >= 400:
-            print(f"❌ Source Blocked: {r.status_code}")
-            # User ko technical error mat dikhao, bas batao link expire ho gaya
-            raise HTTPException(status_code=400, detail="Download Link Expired. Please Scan Again.")
+            print(f"❌ Blocked: {r.status_code}")
+            # Return the exact error code so we know what happened
+            raise HTTPException(status_code=400, detail=f"Source Blocked (Code: {r.status_code})")
 
-        # File Name Clean-up
+        # 5. Prepare File Metadata
         content_type = r.headers.get('content-type', 'application/octet-stream')
         safe_title = "".join([c for c in title if c.isalnum() or c in " _-"])[:40]
         
@@ -148,13 +132,13 @@ def stream_content(target: str = Query(...), title: str = Query("file"), key: st
         
         filename = f"{safe_title}.{ext}"
 
-        # Generator function taake memory crash na ho
+        # 6. Stream Generator (Safe Yield)
         def iterfile():
             try:
                 for chunk in r.iter_content(chunk_size=64*1024):
                     if chunk: yield chunk
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ Stream Cutoff: {e}")
 
         return StreamingResponse(
             iterfile(),
@@ -162,9 +146,23 @@ def stream_content(target: str = Query(...), title: str = Query("file"), key: st
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
 
+    # 7. CATCH SPECIFIC ERRORS (This is what you need to see)
+    except requests.exceptions.ConnectTimeout:
+        print("❌ Error: ConnectTimeout")
+        raise HTTPException(status_code=504, detail="Error: Server Connection Timed Out")
+    except requests.exceptions.ReadTimeout:
+        print("❌ Error: ReadTimeout")
+        raise HTTPException(status_code=504, detail="Error: Download took too long")
+    except requests.exceptions.SSLError as e:
+        print(f"❌ Error: SSL {e}")
+        raise HTTPException(status_code=502, detail="Error: SSL Handshake Failed")
+    except requests.exceptions.ConnectionError as e:
+        print(f"❌ Error: ConnectionError {e}")
+        raise HTTPException(status_code=502, detail=f"Error: Network Failed ({str(e)})")
     except Exception as e:
-        print(f"Stream Error: {e}")
-        raise HTTPException(status_code=500, detail="Server Connection Failed")
+        # CATCH ALL
+        print(f"❌ CRITICAL: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"System Error: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
