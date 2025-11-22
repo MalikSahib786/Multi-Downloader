@@ -4,5 +4,3 @@ yt-dlp
 requests
 pydantic
 python-dotenv
-beautifulsoup4
-lxml
