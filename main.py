@@ -13,17 +13,21 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Disable SSL Warnings (We verify=False to allow all downloads)
+# Disable SSL Warnings (Crucial for scraping old sites)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="Ultimate Media API", version="13.0.0")
+app = FastAPI(title="Ultimate Media API", version="14.0.0")
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 MASTER_KEY = "123Lock.on"
-USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+# --- USER AGENTS (The Chameleon Kit) ---
+UA_CHROME = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+UA_VLC = 'VLC/3.0.16 LibVLC/3.0.16'
+UA_WGET = 'Wget/1.21.4'
 
 class MediaRequest(BaseModel):
     url: str
@@ -36,32 +40,25 @@ def format_size(bytes_size):
     if not bytes_size: return "Unknown Size"
     return f"{round(bytes_size / 1024 / 1024, 1)} MB"
 
-# --- ROBUST NETWORK SESSION (The Fix for Connection Failed) ---
-def get_robust_session():
+# --- NETWORK SESSION ---
+def get_session():
     session = requests.Session()
-    # Retry 3 times on connection errors, status 500, 502, 503, 504
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=1, # Wait 1s, then 2s, then 4s
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS"]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
     return session
 
 # --- SCRAPER LOGIC ---
 def try_advanced_scrape(url):
     try:
-        session = get_robust_session()
-        headers = {'User-Agent': USER_AGENT}
-        res = session.get(url, headers=headers, timeout=15, verify=False)
+        session = get_session()
+        res = session.get(url, headers={'User-Agent': UA_CHROME}, timeout=15, verify=False)
         soup = BeautifulSoup(res.text, 'lxml')
         
-        title = soup.title.string if soup.title else "Media File"
+        title = soup.title.string if soup.title else "Media"
         
-        # JSON-LD Check
+        # JSON-LD
         scripts = soup.find_all('script', type='application/ld+json')
         for script in scripts:
             try:
@@ -78,12 +75,11 @@ def try_advanced_scrape(url):
                     if i: return {"url": i, "title": title, "type": "image", "label": "High Res Image"}
             except: continue
 
-        # Meta Tags Check
+        # Meta Tags
         og_img = soup.find('meta', property='og:image')
         if og_img: return {"url": og_img['content'], "title": title, "type": "image", "label": "Preview Image"}
 
-    except Exception as e:
-        print(f"Scrape Failed: {e}")
+    except: pass
     return None
 
 @app.post("/extract", dependencies=[Depends(verify_api_key)])
@@ -91,13 +87,13 @@ def extract_media(request: MediaRequest):
     url = request.url
     print(f"🔍 Processing: {url}")
 
-    # Skip yt-dlp for Canva/Posts
+    # Skip yt-dlp for Canva/Pinterest
     if "canva.com" not in url and "pinterest" not in url:
         try:
             ydl_opts = {
                 'quiet': True, 'no_warnings': True, 'noplaylist': True,
                 'force_ipv4': True, 'nocheckcertificate': True,
-                'user_agent': USER_AGENT,
+                'user_agent': UA_CHROME, # Match extraction agent
             }
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -149,7 +145,7 @@ def extract_media(request: MediaRequest):
 
     raise HTTPException(status_code=404, detail="Could not find media.")
 
-# --- THE PROFESSIONAL STREAMING ENDPOINT ---
+# --- THE CHAMELEON STREAMING ENDPOINT ---
 @app.get("/stream")
 def stream_content(target: str = Query(...), title: str = Query("file"), key: str = Query(...)):
     if key != MASTER_KEY:
@@ -157,31 +153,41 @@ def stream_content(target: str = Query(...), title: str = Query("file"), key: st
 
     try:
         target_url = unquote(target)
-        session = get_robust_session() # Use the robust session
+        session = get_session()
         
-        # Strategy 1: Identity Headers
-        headers = {'User-Agent': USER_AGENT}
+        # 1. DETERMINE INITIAL STRATEGY
+        headers = {'User-Agent': UA_CHROME}
+        
         if "tiktok.com" in target_url or "akamaized" in target_url:
             headers['Referer'] = 'https://www.tiktok.com/'
         elif "googlevideo.com" in target_url:
-            headers = {} # Send NO headers for YouTube (Works best for signed URLs)
+            # YouTube specific: Some require empty, some require user agent. Start with empty.
+            headers = {} 
 
-        # Connect (Stream=True, Verify=False)
-        # Timeout=(ConnectionTimeout, ReadTimeout) -> (10s to connect, 60s to read)
+        # 2. ATTEMPT 1 (Standard/Platform Specific)
+        print(f"Stream Attempt 1 for {title}...")
         external_req = session.get(target_url, headers=headers, stream=True, verify=False, timeout=(10, 60))
 
-        # Strategy 2: Retry Without Headers (If 403/401 occurs)
+        # 3. ATTEMPT 2 (If 403: Try VLC Media Player Spoof)
         if external_req.status_code in [401, 403]:
-            print(f"Strategy 1 blocked ({external_req.status_code}). Retrying raw...")
-            external_req = session.get(target_url, stream=True, verify=False, timeout=(10, 60))
+            print(f"Attempt 1 blocked ({external_req.status_code}). Trying VLC Spoof...")
+            headers_vlc = {'User-Agent': UA_VLC} # Many CDNs allow VLC without restrictions
+            external_req = session.get(target_url, headers=headers_vlc, stream=True, verify=False, timeout=(10, 60))
 
-        # Final Check
+        # 4. ATTEMPT 3 (If still blocked: Try Wget / Raw)
+        if external_req.status_code in [401, 403]:
+            print(f"Attempt 2 blocked. Trying Wget Spoof...")
+            headers_wget = {'User-Agent': UA_WGET}
+            external_req = session.get(target_url, headers=headers_wget, stream=True, verify=False, timeout=(10, 60))
+            
+        # 5. FINAL CHECK
         if external_req.status_code >= 400:
-            print(f"FINAL ERROR: {external_req.status_code} on {target_url}")
-            raise HTTPException(status_code=400, detail=f"Upstream Server Blocked Request: {external_req.status_code}")
+            print(f"ALL ATTEMPTS FAILED. Code: {external_req.status_code}")
+            raise HTTPException(status_code=400, detail=f"Upstream Blocked ({external_req.status_code}). Link may have expired.")
 
+        # 6. PREPARE RESPONSE
         content_type = external_req.headers.get('content-type', 'application/octet-stream')
-        safe_title = "".join([c for c in title if c.isalnum() or c in " _-"])[:40]
+        safe_title = "".join([c for c in title if c.isalnum() or c in " _-"])[:50]
         
         ext = "mp4"
         if "image" in content_type: ext = "jpg"
@@ -195,18 +201,9 @@ def stream_content(target: str = Query(...), title: str = Query("file"), key: st
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
 
-    except requests.exceptions.SSLError:
-        print("SSL Error")
-        raise HTTPException(status_code=500, detail="Source SSL Certificate Error")
-    except requests.exceptions.ConnectionError:
-        print("Connection Error")
-        raise HTTPException(status_code=500, detail="Could not connect to video source")
-    except requests.exceptions.Timeout:
-        print("Timeout Error")
-        raise HTTPException(status_code=504, detail="Source took too long to respond")
     except Exception as e:
-        print(f"CRITICAL UNKNOWN: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Stream Error: {str(e)}")
+        print(f"Stream Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Connection Error: {str(e)}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
