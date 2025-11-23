@@ -1,4 +1,5 @@
 fastapi
 uvicorn
-requests
+yt-dlp
 pydantic
+python-dotenv
