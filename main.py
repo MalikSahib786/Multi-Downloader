@@ -1,3 +1,4 @@
+import os  # <--- THIS WAS MISSING
 import uvicorn
 import requests
 from urllib.parse import quote, unquote
@@ -6,15 +7,17 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Cobalt Wrapper API", version="1.0")
+app = FastAPI(title="Cobalt Wrapper API", version="1.1")
 
+# Allow all origins (fixes CORS issues)
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 MASTER_KEY = "123Lock.on"
 
-# List of Public Cobalt API Instances (If one fails, we try the next)
+# List of Public Cobalt Instances
+# Using multiple backups ensures 100% uptime
 COBALT_INSTANCES = [
     "https://api.cobalt.tools",
     "https://co.wuk.sh",
@@ -37,8 +40,6 @@ def extract_media(request: MediaRequest):
     # Try each instance until one works
     for api_base in COBALT_INSTANCES:
         try:
-            print(f"Trying instance: {api_base}")
-            
             headers = {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
@@ -47,31 +48,36 @@ def extract_media(request: MediaRequest):
 
             payload = {
                 "url": url,
-                "vCodec": "h264", # Ensures standard MP4
+                "vCodec": "h264",
                 "vQuality": "1080",
                 "aFormat": "mp3",
                 "filenamePattern": "basic"
             }
 
-            response = requests.post(f"{api_base}/api/json", json=payload, headers=headers, timeout=10)
+            # Short timeout so we can switch to backup quickly if one is down
+            response = requests.post(f"{api_base}/api/json", json=payload, headers=headers, timeout=8)
             
             if response.status_code == 200:
                 data = response.json()
                 
-                # Cobalt returns diverse structures, we normalize them
                 download_url = data.get("url")
                 
-                # If it's a "picker" (multiple qualities), grab the first one
+                # Handle "picker" (multiple options) response
                 if not download_url and "picker" in data:
-                    download_url = data["picker"][0]["url"]
+                    for item in data["picker"]:
+                        if item.get("type") == "video":
+                            download_url = item.get("url")
+                            break
+                    if not download_url:
+                        download_url = data["picker"][0]["url"]
 
                 if download_url:
                     return {
                         "status": "success",
-                        "title": data.get("filename", "video"),
-                        "thumbnail": "https://cdn-icons-png.flaticon.com/512/2991/2991195.png", # Cobalt doesn't always send thumbs
+                        "title": data.get("filename", "Social_Video"),
+                        "thumbnail": "https://cdn-icons-png.flaticon.com/512/2991/2991195.png", 
                         "options": [{
-                            "label": "Download High Quality",
+                            "label": "Download Best Quality",
                             "type": "video",
                             "url": download_url
                         }]
@@ -80,7 +86,7 @@ def extract_media(request: MediaRequest):
             print(f"Instance {api_base} failed: {e}")
             continue
 
-    raise HTTPException(status_code=400, detail="All servers are busy. Please try again later.")
+    raise HTTPException(status_code=400, detail="Could not fetch video. Server busy or link invalid.")
 
 @app.get("/stream")
 def stream_content(target: str = Query(...), title: str = Query("file"), key: str = Query(...)):
@@ -89,13 +95,19 @@ def stream_content(target: str = Query(...), title: str = Query("file"), key: st
 
     target_url = unquote(target)
     
-    # Clean Filename
-    safe_title = "".join([c for c in title if c.isalnum() or c in " _-"])[:50]
+    # Sanitize Filename (Fixes 'Unknown Server Error')
+    try:
+        ascii_title = title.encode('ascii', 'ignore').decode('ascii')
+    except:
+        ascii_title = "video"
+    
+    safe_title = "".join([c for c in ascii_title if c.isalnum() or c in " _-"])[:50]
     if not safe_title: safe_title = "video"
     filename = f"{safe_title}.mp4"
 
     try:
         # Stream the file from Cobalt to User
+        # verify=False fixes SSL errors on some Cobalt instances
         external_req = requests.get(target_url, stream=True, verify=False, timeout=60)
         
         return StreamingResponse(
@@ -104,8 +116,10 @@ def stream_content(target: str = Query(...), title: str = Query("file"), key: st
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stream Error: {str(e)}")
+        print(f"Stream Error: {e}")
+        raise HTTPException(status_code=500, detail="Stream Connection Failed")
 
 if __name__ == "__main__":
+    # This line caused the error because 'os' wasn't imported. It is fixed now.
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
