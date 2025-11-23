@@ -1,4 +1,4 @@
-import os  # <--- FIXED: Added missing import
+import os
 import uvicorn
 import yt_dlp
 import subprocess
@@ -8,14 +8,13 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Social Media API", version="IPv4.Fast.3.0")
+app = FastAPI(title="Social Media API", version="Stable.Final")
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 MASTER_KEY = "123Lock.on"
-# Mobile UA for TikTok/IG
 MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
 
 class MediaRequest(BaseModel):
@@ -30,36 +29,33 @@ def format_size(bytes_size):
     return f"{round(bytes_size / 1024 / 1024, 1)} MB"
 
 def is_invalid_link(url):
-    if "facebook.com/watch/" in url and "?v=" not in url: return True
+    if "facebook.com/watch/" in url and "?v=" not in url and "videos/" not in url: return True
+    if url.strip() == "https://www.youtube.com/" or url.strip() == "https://m.youtube.com/": return True
     return False
 
-# --- FALLBACK IMAGE SCRAPER ---
+# Fallback (Placeholder)
 def try_social_image_scrape(url):
-    # (Simple placeholder to avoid import errors if requests fails)
     return None
 
 @app.post("/extract", dependencies=[Depends(verify_api_key)])
 def extract_media(request: MediaRequest):
     raw_url = request.url
+    # Fix Twitter Links
     url = raw_url.replace("x.com", "twitter.com")
-    print(f"📱 Extracting (IPv4): {url}")
+    print(f"📱 Extracting: {url}")
 
     if is_invalid_link(url):
-        raise HTTPException(status_code=400, detail="Invalid Link")
+        raise HTTPException(status_code=400, detail="Please paste a specific VIDEO link.")
 
     try:
-        # YT-DLP Configuration (Optimized for Railway)
         ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'force_ipv4': True,      # CRITICAL: Fixes DNS Errors
-            'nocheckcertificate': True,
-            'socket_timeout': 10,    # Fast timeout
+            'quiet': True, 'no_warnings': True, 'noplaylist': True,
+            'force_ipv4': True, 'nocheckcertificate': True,
             'user_agent': MOBILE_UA,
+            'socket_timeout': 15,
         }
 
-        # YouTube Specifics (Android Client to bypass Bot Block)
+        # YouTube Bot Bypass
         if "youtube.com" in url or "youtu.be" in url:
              ydl_opts['extractor_args'] = {
                 'youtube': {
@@ -72,6 +68,7 @@ def extract_media(request: MediaRequest):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             
+            # Logic to find best formats
             video_options = {}
             audio_option = None
             
@@ -79,29 +76,28 @@ def extract_media(request: MediaRequest):
             duration = info.get('duration', 0)
 
             for f in formats:
-                # AUDIO
+                # Audio Logic
                 if f.get('vcodec') == 'none' and f.get('acodec') != 'none':
-                    # Size Calculation (Bitrate * Duration / 8)
                     size = f.get('filesize') or f.get('filesize_approx') or 0
                     if not size and f.get('tbr') and duration: size = int((f.get('tbr') * 1024 * duration) / 8)
                     
                     audio_option = {
                         "type": "audio",
                         "label": f"Audio Only - {f.get('ext')} ({format_size(size)})",
-                        "res_val": 0,
-                        "url": f['url'],
-                        "filesize": size
+                        "url": f['url']
+                        # Note: We stopped sending 'filesize' to frontend to avoid confusion,
+                        # since we can't use it in the header anymore.
                     }
 
-                # VIDEO
+                # Video Logic
                 elif f.get('vcodec') != 'none' and f.get('acodec') != 'none' and f.get('ext') == 'mp4':
                     height = f.get('height', 0)
                     if not height: continue
                     
-                    # Size Calculation
                     size = f.get('filesize') or f.get('filesize_approx') or 0
                     if not size and f.get('tbr') and duration: size = int((f.get('tbr') * 1024 * duration) / 8)
                     
+                    # Filter for best quality per resolution
                     current_stored = video_options.get(height)
                     if not current_stored or size > current_stored['raw_size']:
                         video_options[height] = {
@@ -109,8 +105,7 @@ def extract_media(request: MediaRequest):
                             "label": f"{height}p HD ({format_size(size)})",
                             "res_val": height,
                             "raw_size": size,
-                            "url": f['url'],
-                            "filesize": size
+                            "url": f['url']
                         }
 
             final_options = list(video_options.values())
@@ -121,8 +116,7 @@ def extract_media(request: MediaRequest):
             # Fallback
             if not final_options:
                  direct_url = info.get('url')
-                 if direct_url: 
-                     final_options.append({"type": "video", "label": "Best Quality", "url": direct_url, "filesize": 0})
+                 if direct_url: final_options.append({"type": "video", "label": "Best Quality", "url": direct_url})
 
             return {
                 "status": "success",
@@ -134,22 +128,23 @@ def extract_media(request: MediaRequest):
     except Exception as e:
         print(f"Error: {e}")
         if "Sign in" in str(e):
-             raise HTTPException(status_code=400, detail="YouTube blocked this Server IP. Cookies required.")
+             raise HTTPException(status_code=400, detail="Server IP blocked by YouTube (Cookies required).")
         raise HTTPException(status_code=400, detail="Could not find media.")
 
 @app.get("/stream")
-def stream_content(target: str = Query(...), title: str = Query("file"), size: int = Query(None), key: str = Query(...)):
+def stream_content(target: str = Query(...), title: str = Query("file"), key: str = Query(...)):
     if key != MASTER_KEY:
         raise HTTPException(status_code=403, detail="Invalid Key")
 
     target_url = unquote(target)
-    
-    # Extension Logic
+    print(f"☢️ Streaming: {target_url[:30]}...")
+
+    # 1. Fix Extension
     ext = "mp4"
     if ".jpg" in target_url or "yt3.ggpht" in target_url: ext = "jpg"
     elif ".mp3" in target_url or "audio" in title.lower(): ext = "mp3"
     
-    # Sanitize Filename
+    # 2. Fix Filename (ASCII Only)
     try:
         ascii_title = title.encode('ascii', 'ignore').decode('ascii')
     except: ascii_title = "video"
@@ -157,24 +152,15 @@ def stream_content(target: str = Query(...), title: str = Query("file"), size: i
     if not safe_title: safe_title = "download"
     filename = f"{safe_title}.{ext}"
 
-    # Headers with Content-Length
+    # 3. HEADERS (No Content-Length)
+    # We removed 'Content-Length' to prevent the "LocalProtocolError" crash.
+    # The browser will simply show "Downloading..." without a progress % bar,
+    # but the download WILL finish successfully.
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    if size and size > 0: headers["Content-Length"] = str(size)
 
     def iterfile():
-        # Force IPv4 in Subprocess to avoid "NameResolutionError"
-        cmd = [
-            "yt-dlp", 
-            "--force-ipv4", 
-            "--no-part", 
-            "--quiet", 
-            "--no-warnings", 
-            "-o", "-", 
-            target_url
-        ]
-        
-        if "googlevideo" in target_url:
-             cmd.extend(["--user-agent", MOBILE_UA])
+        cmd = ["yt-dlp", "--force-ipv4", "--no-part", "--quiet", "--no-warnings", "-o", "-", target_url]
+        if "googlevideo" in target_url: cmd.extend(["--user-agent", MOBILE_UA])
 
         try:
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10**7)
@@ -194,6 +180,5 @@ def stream_content(target: str = Query(...), title: str = Query("file"), size: i
     )
 
 if __name__ == "__main__":
-    # Ensure 'os' is imported at the top!
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
