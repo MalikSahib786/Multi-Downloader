@@ -10,16 +10,17 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Social Media API", version="QualityFixed.Pro")
+app = FastAPI(title="Social Media API", version="PhotoFix.2.0")
 
-# ALLOW ALL ORIGINS
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
 MASTER_KEY = "123Lock.on"
-# Mobile UA is best for TikTok/IG compatibility
+
+# User Agents
 MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 class MediaRequest(BaseModel):
     url: str
@@ -32,46 +33,44 @@ def format_size(bytes_size):
     if not bytes_size: return "Unknown Size"
     return f"{round(bytes_size / 1024 / 1024, 1)} MB"
 
-def is_invalid_link(url):
-    if "facebook.com/watch/" in url and "?v=" not in url and "videos/" not in url:
-        return True
-    if url.strip() == "https://www.youtube.com/" or url.strip() == "https://m.youtube.com/":
-        return True
-    return False
-
-# Fallback for YouTube Posts / Images
+# --- FIX 1: TWITTER/X IMAGE SCRAPER ---
 def try_social_image_scrape(url):
+    print("⚠️ yt-dlp failed. Checking for Images (Twitter/Insta)...")
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        # Twitter requires Desktop UA to show meta tags
+        headers = {'User-Agent': DESKTOP_UA}
         res = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         
+        # Check for OpenGraph Image
         og_img = soup.find('meta', property='og:image')
         if og_img and og_img.get('content'):
-            title = soup.title.string if soup.title else "Social Media Image"
+            title = soup.title.string or "Social Media Image"
             return {
                 "status": "success",
                 "title": title,
                 "thumbnail": og_img['content'],
                 "source": "Image Scraper",
-                "options": [{"type": "image", "label": "Download Image (HD)", "url": og_img['content']}]
+                "options": [{
+                    "type": "image", 
+                    "label": "Download Image (HD)", 
+                    "url": og_img['content']
+                }]
             }
-    except:
-        pass
+    except Exception as e:
+        print(f"Image Scrape Error: {e}")
     return None
 
 @app.post("/extract", dependencies=[Depends(verify_api_key)])
 def extract_media(request: MediaRequest):
     raw_url = request.url
-    # Fix Twitter/X links for better compatibility
+    # Auto-fix x.com links
     url = raw_url.replace("x.com", "twitter.com")
     
     print(f"📱 Extracting: {url}")
 
-    if is_invalid_link(url):
-        raise HTTPException(status_code=400, detail="Please paste a specific VIDEO link.")
-
     try:
+        # 1. Try Video Extraction (yt-dlp)
         ydl_opts = {
             'quiet': True, 'no_warnings': True, 'noplaylist': True,
             'force_ipv4': True, 'nocheckcertificate': True,
@@ -81,80 +80,48 @@ def extract_media(request: MediaRequest):
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            
-            # --- RESOLUTION SORTING SYSTEM ---
-            video_options = {} # Dictionary to store best version per resolution
-            audio_option = None
-            
-            formats = info.get('formats', [])
+            formats_list = []
             duration = info.get('duration', 0)
 
-            for f in formats:
-                # 1. AUDIO ONLY (Find best quality)
-                if f.get('vcodec') == 'none' and f.get('acodec') != 'none':
-                    size = f.get('filesize') or f.get('filesize_approx') or 0
-                    if not size and f.get('tbr') and duration: size = (f.get('tbr') * 1024 * duration) / 8
-                    
-                    # Always update to keep the last (usually best) audio
-                    audio_option = {
-                        "type": "audio",
-                        "label": f"Audio Only - {f.get('ext')} ({format_size(size)})",
-                        "res_val": 0,
-                        "url": f['url']
-                    }
+            if 'formats' in info:
+                for f in info['formats']:
+                    if f.get('url'):
+                        f_ext = f.get('ext')
+                        f_res = f.get('resolution') or f"{f.get('height')}p"
+                        size = f.get('filesize') or f.get('filesize_approx')
+                        if not size and f.get('tbr') and duration:
+                            size = (f.get('tbr') * 1024 * duration) / 8
+                        size_str = format_size(size)
 
-                # 2. VIDEO (MP4 + Audio)
-                elif f.get('vcodec') != 'none' and f.get('acodec') != 'none' and f.get('ext') == 'mp4':
-                    height = f.get('height', 0)
-                    if not height: continue
-                    
-                    # Calculate Size
-                    size = f.get('filesize') or f.get('filesize_approx') or 0
-                    if not size and f.get('tbr') and duration: size = (f.get('tbr') * 1024 * duration) / 8
-                    
-                    # Resolution grouping logic:
-                    # If we already have a 720p video, only replace it if this new one is bigger (better quality)
-                    current_stored = video_options.get(height)
-                    if not current_stored or size > current_stored['raw_size']:
-                        video_options[height] = {
-                            "type": "video",
-                            "label": f"{height}p HD - {format_size(size)}",
-                            "res_val": height,
-                            "raw_size": size,
-                            "url": f['url']
-                        }
+                        if f_ext == 'mp4' and f.get('vcodec') != 'none':
+                            formats_list.append({"type": "video", "label": f"{f_res} ({size_str})", "url": f['url']})
+                        elif f.get('vcodec') == 'none' and f.get('acodec') != 'none':
+                             formats_list.append({"type": "audio", "label": f"Audio - {f_ext}", "url": f['url']})
 
-            # Convert Dict to List and Sort
-            final_options = list(video_options.values())
-            # Sort High to Low (1080p -> 720p -> 480p)
-            final_options.sort(key=lambda x: x['res_val'], reverse=True)
-            
-            # Add Audio option at the end
-            if audio_option:
-                final_options.append(audio_option)
-
-            # Fallback for TikToks/Reels where explicit formats might be weird
-            if not final_options:
+            if not formats_list:
                  direct_url = info.get('url')
-                 if direct_url: 
-                     final_options.append({"type": "video", "label": "Best Quality (Auto)", "url": direct_url})
+                 if direct_url: formats_list.append({"type": "video", "label": "Best Quality", "url": direct_url})
+
+            formats_list.reverse()
 
             return {
                 "status": "success",
                 "title": info.get('title') or "Video",
                 "thumbnail": info.get('thumbnail'),
                 "source": info.get('extractor_key'),
-                "options": final_options
+                "options": formats_list
             }
 
     except Exception as e:
         print(f"yt-dlp error: {e}")
-        # Try Fallback Scraper (Images)
+        
+        # 2. If yt-dlp fails, Try Image Scraper (Fixes Twitter Photos)
         image_data = try_social_image_scrape(url)
         if image_data: return image_data
         
         raise HTTPException(status_code=400, detail="Could not find media.")
 
+# --- FIX 2: ROBUST STREAMING ---
 @app.get("/stream")
 def stream_content(target: str = Query(...), title: str = Query("file"), key: str = Query(...)):
     if key != MASTER_KEY:
@@ -163,27 +130,33 @@ def stream_content(target: str = Query(...), title: str = Query("file"), key: st
     target_url = unquote(target)
     print(f"☢️ Native Streaming: {target_url[:30]}...")
 
-    # 1. Fix Extension
+    # A. Determine File Type
     ext = "mp4"
-    if ".jpg" in target_url or "yt3.ggpht" in target_url: ext = "jpg"
-    elif ".mp3" in target_url or "audio" in title.lower(): ext = "mp3"
+    if ".jpg" in target_url or "pbs.twimg.com" in target_url or "yt3.ggpht" in target_url: 
+        ext = "jpg"
+    elif ".mp3" in target_url or "audio" in title.lower(): 
+        ext = "mp3"
     
-    # 2. Fix Filename (Force ASCII to prevent Netlify/Browser 500 Error)
+    # B. CRITICAL: Force ASCII Filename
+    # This fixes the "stream.json" error. Browsers crash if headers have Emoji/Korean.
     try:
         ascii_title = title.encode('ascii', 'ignore').decode('ascii')
     except:
-        ascii_title = "video"
-        
+        ascii_title = "media_file"
+    
     safe_title = "".join([c for c in ascii_title if c.isalnum() or c in " _-"])[:50]
-    if not safe_title: safe_title = "downloaded_video"
-
+    if not safe_title.strip(): safe_title = "downloaded_media"
+    
     filename = f"{safe_title}.{ext}"
 
     def iterfile():
-        # Using Subprocess (Native) to bypass Python Requests Blocking
+        # C. Use yt-dlp to stream output (Bypasses Python Requests 403)
         cmd = ["yt-dlp", "--no-part", "--quiet", "--no-warnings", "-o", "-", target_url]
+        
         if "googlevideo" in target_url:
             cmd.extend(["--user-agent", MOBILE_UA])
+        elif "twimg" in target_url:
+            cmd.extend(["--user-agent", DESKTOP_UA])
 
         try:
             process = subprocess.Popen(
