@@ -1,7 +1,5 @@
 fastapi
 uvicorn
-yt-dlp
+curl_cffi
 pydantic
 python-dotenv
-requests
-beautifulsoup4
