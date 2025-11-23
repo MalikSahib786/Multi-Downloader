@@ -1,5 +1,4 @@
 fastapi
 uvicorn
-curl_cffi
+requests
 pydantic
-python-dotenv
